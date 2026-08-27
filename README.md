@@ -5,6 +5,17 @@ rules and weekly roadmap.
 
 ## Status
 
+Week 7 complete: `ai-orchestration/` (Python) adds the AI intelligence
+foundation - one Isolation Forest per service trained on Memory-eligible
+real baseline telemetry (never Evaluation-set data, enforced in code), a
+local Ollama LLM integration for structured anomaly interpretation
+(graceful degradation if unavailable, never executes actions), and a
+real LangGraph workflow (`extract_features -> detect_anomaly -> normal |
+anomaly -> interpret -> finalize`) that Week 8's RCA/RAG/remediation
+agents will extend. See `ai-orchestration/README.md` for full
+architecture, the feature schema, live verification results, and known
+limitations (small real training set; cumulative-counter features).
+
 Week 6 complete: `dataset-tools/` (Python) turns Week 5's raw telemetry
 into a 68-incident labeled dataset (16 real, 52 deterministic synthetic —
 both clearly labeled, never conflated), splits it deterministically
@@ -361,6 +372,23 @@ python -m dataset_tools.chroma_store    # build the ChromaDB collection (Memory 
 python -m dataset_tools.chroma_store query "payment service returning errors after auth failure"
 ```
 
+## AI orchestration foundation (Week 7)
+
+`ai-orchestration/` trains per-service anomaly detectors, interprets anomalies via a local Ollama
+model, and runs both through a LangGraph workflow. Full details:
+[`ai-orchestration/README.md`](ai-orchestration/README.md).
+
+```bash
+cd ai-orchestration
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && pip install -e .
+
+python -m ai_orchestration.anomaly.train    # train + persist all 4 services' models
+
+brew install ollama && ollama serve &        # if not already installed/running
+ollama pull llama3.2:1b                       # small model - see README for why, and how to switch
+```
+
 ## Testing
 
 ```bash
@@ -390,3 +418,10 @@ cd dataset-tools && source .venv/bin/activate && python -m pytest tests/ -v
 `dataset-tools`' tests (42) use a real local ChromaDB `PersistentClient`
 against an isolated `tmp_path` per test - nothing is mocked - and don't
 require any of the four microservices to be running.
+
+```bash
+cd ai-orchestration && source .venv/bin/activate && python -m pytest tests/ -v
+```
+
+`ai-orchestration`'s tests (44) mock Ollama and require no running
+Kubernetes cluster, payment system, or Ollama server.

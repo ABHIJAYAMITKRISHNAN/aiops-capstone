@@ -28,6 +28,10 @@ telemetry/data/
 dataset-tools/data/
 dataset-tools/chroma/
 
+# Week 7 ai-orchestration - trained models are reproducible from telemetry/data/ +
+# dataset-tools/data/memory/ via `python -m ai_orchestration.anomaly.train`
+ai-orchestration/models/*/
+
 # Environment / secrets
 .env
 .env.*

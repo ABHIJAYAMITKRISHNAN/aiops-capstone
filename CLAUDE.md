@@ -126,6 +126,53 @@ The project uses a self-hosted local LLM via Ollama (initial candidate:
 
 ## Current status
 
+Week 7 complete (2026-08-28): `ai-orchestration/` (Python) adds the AI
+intelligence foundation - anomaly detection, local LLM interpretation,
+and a LangGraph workflow - that Week 8's RCA/remediation agents build on.
+One `IsolationForest` per service (not one shared model) is trained on
+`config.SERVICE_FEATURE_SCHEMAS`, since some curated metrics only apply
+to specific services (`hikaricp_*` to ledger-service only, `http_client_*`
+to payment-service only - verified against real telemetry). Training data
+is restricted to NORMAL/RECOVERY-phase telemetry from real experiments
+whose incident is in the Memory set - enforced in code the same way
+`dataset-tools/chroma_store.py` enforces ChromaDB's Memory-only
+constraint: `feature_extractor.load_memory_eligible_baseline_records()`
+only ever reads `dataset-tools/data/memory/memory_incidents.jsonl`, has
+no parameter that could point it at the Evaluation file, and synthetic
+incidents (having no raw telemetry behind them) contribute nothing.
+This currently yields 42-45 real training samples per service (4 real
+experiments landed in Memory out of 16 total). A local Ollama integration
+(`llama3.2:1b`, chosen over CLAUDE.md's originally-named `llama3.1:8b`
+because this machine had only ~8.8GB free disk - documented, not silent,
+and switching back is a one-line env var change) produces a structured
+JSON anomaly interpretation from real evidence only, degrading
+gracefully (never raising) whenever Ollama is unavailable, times out, or
+returns malformed output - it never executes any action. A real
+LangGraph workflow (`extract_features -> detect_anomaly -> normal |
+anomaly -> interpret -> finalize`) ties it together with explicit typed
+state; the LLM is only ever invoked on the anomaly branch (verified by a
+test asserting the mock client is never called on the normal path).
+44 new Python tests pass, and all 19 Week 5 + 42 Week 6 Python tests and
+all 47 Java tests still pass unmodified. Live verification: trained all
+4 real models; installed Ollama and pulled a real model; ran a full
+`graph.invoke()` against a live Ollama server (7.3s round-trip, correct
+structured interpretation); triggered a brand-new live memory-leak
+experiment against the running Kubernetes deployment this week, collected
+fresh telemetry, and confirmed anomaly scores trend upward with
+`jvm_memory_used_bytes` through the fault window; confirmed the full
+payment flow still works and all four faults are inactive afterward.
+Known, disclosed limitation: with only 42-45 real training samples,
+detection is reliable for extreme deviations (verified) but inconsistent
+for some moderate real fault instances (also verified, not hidden) -
+partly because `http_server_requests_count`/`error_count` are cumulative
+Prometheus counters rather than rates, a real behavior discovered and
+documented this week (an error counter was observed to reset to 0
+between experiments despite the request counter continuing to climb and
+zero Kubernetes pod restarts - most likely per-tag Micrometer meter
+eviction after inactivity). See `ai-orchestration/README.md` for full
+architecture, feature schema, and live-verification detail. Waiting for
+explicit instruction to begin Week 8 (RCA Agent, RAG, Remediation Agent).
+
 Week 6 complete (2026-08-28): `dataset-tools/` (Python) reconstructs
 labeled incidents from Week 5's raw telemetry and builds the ChromaDB
 retrieval memory. 16 real incidents (4 per fault type) were reconstructed
