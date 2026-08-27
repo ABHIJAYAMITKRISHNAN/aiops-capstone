@@ -1,0 +1,11 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ledger_db_test
+    username: aiops
+    password: aiops-dev-password
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+
+app:
+  seed-demo-account: false

@@ -1,0 +1,49 @@
+server:
+  port: ${SERVER_PORT:8082}
+
+spring:
+  application:
+    name: payment-service
+
+app:
+  auth-service:
+    base-url: ${AUTH_SERVICE_URL:http://localhost:8081}
+    timeout-ms: ${AUTH_SERVICE_TIMEOUT_MS:5000}
+  ledger-service:
+    base-url: ${LEDGER_SERVICE_URL:http://localhost:8083}
+    timeout-ms: ${LEDGER_SERVICE_TIMEOUT_MS:5000}
+  notification-service:
+    base-url: ${NOTIFICATION_SERVICE_URL:http://localhost:8084}
+    timeout-ms: ${NOTIFICATION_SERVICE_TIMEOUT_MS:5000}
+  fault:
+    memory-leak:
+      # MEMORY_LEAK controlled fault (disabled until POST /inject-memory-leak). Allocation stops
+      # once max-total-bytes is reached, so this can never grow unbounded.
+      chunk-size-bytes: ${MEMORY_LEAK_CHUNK_SIZE_BYTES:5000000}
+      interval-ms: ${MEMORY_LEAK_INTERVAL_MS:1000}
+      max-total-bytes: ${MEMORY_LEAK_MAX_TOTAL_BYTES:200000000}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  health:
+    probes:
+      enabled: true
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: ${spring.application.name}
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [correlationId=%X{correlationId:-none}] %logger{36} - %msg%n"
+  level:
+    com.aiops.payment: INFO

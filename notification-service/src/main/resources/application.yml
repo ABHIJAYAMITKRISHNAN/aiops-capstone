@@ -1,0 +1,37 @@
+server:
+  port: ${SERVER_PORT:8084}
+
+spring:
+  application:
+    name: notification-service
+
+app:
+  fault:
+    notification-latency:
+      # NOTIFICATION_LATENCY controlled fault (disabled until POST /inject-latency).
+      default-delay-ms: ${NOTIFICATION_LATENCY_DEFAULT_DELAY_MS:6000}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  health:
+    probes:
+      enabled: true
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: ${spring.application.name}
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [correlationId=%X{correlationId:-none}] %logger{36} - %msg%n"
+  level:
+    com.aiops.notification: INFO

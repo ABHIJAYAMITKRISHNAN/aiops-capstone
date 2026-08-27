@@ -1,0 +1,328 @@
+# AIOps Self-Healing Microservices Platform
+
+Academic capstone project. See `CLAUDE.md` for the full permanent project
+rules and weekly roadmap.
+
+## Status
+
+Week 4 complete: all four services expose Spring Boot Actuator + Prometheus
+metrics, Prometheus itself runs in-cluster scraping all four, Kubernetes
+readiness/liveness probes are live on all four app Deployments, and all
+four controlled faults (auth key error, payment memory leak, ledger DB pool
+exhaustion, notification latency) are implemented, disabled by default, and
+verified end-to-end (native, Docker Compose, and Kubernetes).
+
+## Prerequisites
+
+**PostgreSQL** (native, via Homebrew) — still used for `ledger-service`'s
+local `mvn test` run outside of Docker/Kubernetes:
+
+```bash
+brew install postgresql@16
+brew services start postgresql@16
+```
+
+One-time setup of the app role and databases:
+
+```bash
+PATH="/opt/homebrew/opt/postgresql@16/bin:$PATH"
+psql -d postgres -c "CREATE ROLE aiops WITH LOGIN PASSWORD 'aiops-dev-password' CREATEDB;"
+psql -d postgres -c "CREATE DATABASE ledger_db OWNER aiops;"
+psql -d postgres -c "CREATE DATABASE ledger_db_test OWNER aiops;"  # used by ledger-service's test suite
+```
+
+**Docker** — via [Colima](https://github.com/abiosoft/colima) (not Docker
+Desktop, to keep everything CLI-driven with no GUI/license click-through):
+
+```bash
+brew install colima docker docker-compose docker-buildx kubectl minikube
+colima start --cpu 4 --memory 6 --disk 20
+```
+
+`docker compose`/`docker buildx` need Homebrew's plugin directory registered once in `~/.docker/config.json`:
+
+```json
+{ "cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins"] }
+```
+
+## Services
+
+### auth-service (port 8081)
+
+Issues and validates JWTs against a hardcoded (in-memory) user store.
+This is a placeholder user store, intentionally kept simple for Week 1;
+it will be replaced with a persisted store in a later week.
+
+Seeded users:
+
+| username | password |
+|---|---|
+| alice | alice-pass |
+| bob | bob-pass |
+
+Endpoints:
+
+- `POST /api/auth/login` — `{"username": "...", "password": "..."}` → `{"token": "...", "tokenType": "Bearer", "expiresInMs": ...}`
+- `POST /api/auth/validate` — `{"token": "..."}` → `{"valid": bool, "username": "...", "roles": [...], "error": "..."}`
+
+Configuration (env vars): `SERVER_PORT` (8081), `JWT_SECRET` (dev-only default — override outside local dev), `JWT_EXPIRATION_MS` (3600000).
+
+**Fault injection** (disabled by default — see "Fault injection" below): `POST /inject-auth-key-error`, `POST /reset-auth-key`.
+
+### ledger-service (port 8083)
+
+Manages accounts and performs debit/credit operations against PostgreSQL
+inside real `@Transactional` boundaries (with pessimistic row locking, so
+concurrent operations on the same account serialize correctly).
+
+Seeds one demo account, `acct-42`, with a balance of 1000.00 USD on
+startup (disable via `SEED_DEMO_ACCOUNT=false`) — a placeholder in the same
+spirit as auth-service's hardcoded user store, since there's no account
+provisioning flow yet.
+
+Endpoints:
+
+- `POST /api/accounts` — `{"accountId", "currency", "initialBalance"}` → `201` `{"accountId", "currency", "balance"}`
+- `GET /api/accounts/{accountId}` → `{"accountId", "currency", "balance"}` or `404`
+- `POST /api/ledger/debit` — `{"accountId", "currency", "amount"}` → `200` transaction record, `404` unknown account, `409` insufficient funds
+- `POST /api/ledger/credit` — same shape, adds instead of subtracting
+
+Configuration (env vars): `SERVER_PORT` (8083), `DB_URL`, `DB_USERNAME`, `DB_PASSWORD`, `DB_POOL_MAX_SIZE` (10 — matches the Week 4 HikariCP fault-injection spec), `SEED_DEMO_ACCOUNT`.
+
+**Fault injection** (disabled by default): `POST /inject-db-lock`, `POST /reset-db-lock` — holds up to `DB_LOCK_CONNECTIONS_TO_HOLD` (default 9, always clamped below the pool max) raw connections from the pool.
+
+### notification-service (port 8084)
+
+Simulates sending a payment receipt — logs the activity and returns a
+`SENT` status. No real email/SMS integration, no persistence.
+
+Endpoint:
+
+- `POST /api/notifications/receipt` — `{"accountId", "currency", "amount", "transactionId", "recipientUsername"}` → `{"notificationId", "status", "sentAt"}`
+
+Configuration (env vars): `SERVER_PORT` (8084).
+
+**Fault injection** (disabled by default): `POST /inject-latency` (optional body `{"delayMs": N}`, default `NOTIFICATION_LATENCY_DEFAULT_DELAY_MS`=6000), `POST /reset-latency`.
+
+### payment-service (port 8082)
+
+Orchestrates the full synchronous chain: validates the caller's JWT with
+auth-service, debits the account via ledger-service, then sends a receipt
+via notification-service.
+
+A notification failure is **not** treated as a payment failure — the money
+has already moved by that point, so it's logged and reported back as
+`notificationStatus: "FAILED"` rather than rolling back or erroring the
+whole request. This asymmetry (Payment Service can be slowed/blocked by a
+downstream Notification problem without the transaction itself failing) is
+intentional groundwork for the Week 4+ fault-injection scenario where a
+Notification-service root cause manifests as a Payment-service symptom.
+
+Endpoint:
+
+- `POST /api/payments` — header `Authorization: Bearer <jwt>`, body `{"accountId", "currency", "amount"}` → `{"status", "message", "authenticatedUser", "ledgerTransactionId", "notificationStatus"}`
+
+Configuration (env vars): `SERVER_PORT` (8082), `AUTH_SERVICE_URL`, `LEDGER_SERVICE_URL`, `NOTIFICATION_SERVICE_URL` (+ matching `*_TIMEOUT_MS` for each, default 5000).
+
+**Fault injection** (disabled by default): `POST /inject-memory-leak`, `POST /reset-memory-leak` — retains `MEMORY_LEAK_CHUNK_SIZE_BYTES` (default 5MB) chunks every `MEMORY_LEAK_INTERVAL_MS` (default 1s), hard-capped at `MEMORY_LEAK_MAX_TOTAL_BYTES` (default 200MB).
+
+### Observability (Actuator + Prometheus)
+
+All four services expose Spring Boot Actuator: `/actuator/health`,
+`/actuator/health/liveness`, `/actuator/health/readiness`,
+`/actuator/info`, `/actuator/metrics`, `/actuator/prometheus`.
+`management.endpoint.health.show-details: always` — fine for this
+local/academic project, not multi-tenant production. Kubernetes
+readiness/liveness probes on all four app Deployments use the
+`/liveness`/`/readiness` sub-paths (15s/30s initial delay, tuned from
+observed real startup times — no restart loops seen in testing).
+
+A Prometheus instance runs inside the cluster (`k8s/prometheus-config.yaml`,
+`k8s/prometheus.yaml`) scraping all four services' `/actuator/prometheus`.
+It's ClusterIP-only, never exposed outside the cluster — reach it via:
+
+```bash
+kubectl port-forward svc/prometheus 9090:9090
+```
+
+Then `http://localhost:9090/targets` should show all four jobs `up`.
+
+### Fault injection
+
+Four controlled faults exist, one per service, matching CLAUDE.md's "Fault
+injection" section. **All are disabled by default, safe, and resettable.**
+Each has an `/inject-*` and matching `/reset-*` endpoint (see each
+service's section above for exact endpoints/config). A quick end-to-end
+demo of any fault:
+
+```bash
+# Auth key error
+curl -X POST http://localhost:8081/inject-auth-key-error
+curl -X POST http://localhost:8081/api/auth/validate -H "Content-Type: application/json" -d '{"token":"<a token from before the fault>"}'  # now invalid
+curl -X POST http://localhost:8081/reset-auth-key
+
+# Memory leak (watch it rise)
+curl -X POST http://localhost:8082/inject-memory-leak
+curl http://localhost:8082/actuator/metrics/jvm.memory.used
+curl -X POST http://localhost:8082/reset-memory-leak
+
+# DB pool exhaustion
+curl -X POST http://localhost:8083/inject-db-lock
+curl http://localhost:8083/actuator/prometheus | grep hikaricp_connections
+curl -X POST http://localhost:8083/reset-db-lock
+
+# Notification latency (payment will time out around 5s, ledger still commits)
+curl -X POST http://localhost:8084/inject-latency
+curl -X POST http://localhost:8082/api/payments -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d '{"accountId":"acct-42","currency":"USD","amount":1.00}'
+curl -X POST http://localhost:8084/reset-latency
+```
+
+The notification-latency fault needs no extra timeout config on the
+Payment side — `app.notification-service.timeout-ms` (5000ms, from Week 2)
+is already shorter than the fault's default 6000ms delay.
+
+### Correlation IDs
+
+All four services read `X-Correlation-Id` from the incoming request
+(generating a UUID if absent), attach it to all log lines via SLF4J MDC,
+return it on the response, and propagate it to every downstream call
+(payment-service → auth-service / ledger-service / notification-service).
+Verified end-to-end: the same correlation ID appears in all four services'
+logs for a single payment request. See `CLAUDE.md` for the full convention.
+
+## Running locally
+
+Each service is an independent Maven project. Start PostgreSQL first (see
+Prerequisites), then in four terminals:
+
+```bash
+cd auth-service && mvn spring-boot:run
+cd ledger-service && DB_PASSWORD=aiops-dev-password mvn spring-boot:run
+cd notification-service && mvn spring-boot:run
+cd payment-service && mvn spring-boot:run
+```
+
+Try the full chain:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8081/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"alice-pass"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+
+curl -i -X POST http://localhost:8082/api/payments \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"accountId":"acct-42","currency":"USD","amount":150.25}'
+
+curl http://localhost:8083/api/accounts/acct-42   # confirm the balance moved
+```
+
+## Running with Docker Compose
+
+Builds and runs all four services plus a PostgreSQL container, fully wired
+together on one Docker network:
+
+```bash
+docker compose up -d --build
+```
+
+Same endpoints as native (`localhost:8081`/`8082`/`8083`/`8084`). The
+compose Postgres is exposed on host port **5433** (not 5432) so it doesn't
+collide with the native Homebrew Postgres from the Prerequisites section —
+containers still reach it internally via `postgres:5432`. `JWT_SECRET` and
+`DB_PASSWORD` can be overridden via a `.env` file; they default to the same
+dev-only placeholder values used elsewhere in this repo.
+
+```bash
+docker compose down          # stop and remove containers (keeps the postgres-data volume)
+docker compose logs -f       # follow all services' logs
+```
+
+## Running on Kubernetes (Minikube)
+
+```bash
+minikube start --driver=docker --cpus=2 --memory=3500mb
+```
+
+Build the images and load them into Minikube's internal image store (it
+doesn't share the host/Colima Docker daemon):
+
+```bash
+docker compose build
+for svc in auth-service ledger-service notification-service payment-service; do
+  docker tag capstone_2026-$svc:latest aiops/$svc:0.1.0
+done
+```
+
+**Important**: `minikube image load` can silently keep a stale image under
+an already-existing tag — confirmed by comparing `docker inspect
+aiops/<svc>:0.1.0 --format '{{.Id}}'` between the host daemon and `minikube
+ssh -- docker inspect ...`. After the very first load this doesn't matter,
+but on every *rebuild*, force-remove the old tag from Minikube's daemon
+first, or the running pods can end up serving old code with no error at
+apply time:
+
+```bash
+kubectl scale deployment auth-service ledger-service notification-service payment-service --replicas=0
+for svc in auth-service ledger-service notification-service payment-service; do
+  minikube ssh -- "docker rmi -f aiops/$svc:0.1.0" || true
+  minikube image load aiops/$svc:0.1.0
+done
+kubectl scale deployment auth-service ledger-service notification-service payment-service --replicas=1
+```
+
+Create the secret the manifests reference (not committed to git — dev-only
+placeholder values, same ones already used elsewhere in this repo):
+
+```bash
+kubectl create secret generic aiops-secrets \
+  --from-literal=jwt-secret='dev-only-insecure-secret-key-change-me-1234567890' \
+  --from-literal=db-password='aiops-dev-password'
+```
+
+Deploy everything and check status:
+
+```bash
+kubectl apply -f k8s/
+kubectl get pods
+```
+
+`ledger-service` may restart once or twice on first boot if it starts
+before postgres's readiness probe passes — Kubernetes' default restart
+policy handles this without an explicit init-container wait, and it
+settles once postgres is ready.
+
+Reach the services from your host (each in its own terminal, or backgrounded):
+
+```bash
+kubectl port-forward svc/auth-service 8081:8081
+kubectl port-forward svc/ledger-service 8083:8083
+kubectl port-forward svc/notification-service 8084:8084
+kubectl port-forward svc/payment-service 8082:8082
+kubectl port-forward svc/prometheus 9090:9090
+```
+
+Then the same curl flow as above works against `localhost`. Postgres in
+this setup uses a `PersistentVolumeClaim`, and all four app Deployments/
+Services use the exact same env-var contract (`AUTH_SERVICE_URL`, `DB_URL`,
+etc.) as native and Compose — just pointed at Kubernetes Service DNS names
+instead of `localhost`/compose service names.
+
+Tear down: `kubectl delete -f k8s/` (the PVC and its data persist unless
+you also `kubectl delete pvc postgres-pvc`). `minikube stop` pauses the
+cluster; `minikube delete` removes it entirely.
+
+## Testing
+
+```bash
+cd auth-service && mvn test
+cd ledger-service && mvn test          # needs Postgres running; uses the ledger_db_test database
+cd notification-service && mvn test
+cd payment-service && mvn test
+```
+
+`payment-service`'s tests use OkHttp MockWebServer to stand in for all
+three downstream services, so they don't require any other service to be
+running. `ledger-service`'s tests run against a real PostgreSQL database
+(`ledger_db_test`), each wrapped in a rolled-back transaction so the schema
+stays clean between runs.

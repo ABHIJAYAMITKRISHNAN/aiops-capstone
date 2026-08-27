@@ -1,0 +1,40 @@
+# Java / Maven
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Node (Streamlit/tooling side artifacts, if any)
+node_modules/
+
+# Logs
+*.log
+
+# Local data / vector store
+chroma_db/
+*.sqlite3
+
+# Kubernetes local
+.kube/
+
+# OS
+Thumbs.db

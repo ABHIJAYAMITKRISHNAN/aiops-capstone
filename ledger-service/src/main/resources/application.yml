@@ -1,0 +1,54 @@
+server:
+  port: ${SERVER_PORT:8083}
+
+spring:
+  application:
+    name: ledger-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/ledger_db}
+    username: ${DB_USERNAME:aiops}
+    # Dev-only default. Override with the DB_PASSWORD env var in every non-local environment.
+    password: ${DB_PASSWORD:aiops-dev-password}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:10}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+app:
+  seed-demo-account: ${SEED_DEMO_ACCOUNT:true}
+  fault:
+    db-lock:
+      # DB_POOL_EXHAUSTION controlled fault (disabled until POST /inject-db-lock). Clamped at
+      # runtime to (maximum-pool-size - 1) so it can never hold every connection in the pool.
+      connections-to-hold: ${DB_LOCK_CONNECTIONS_TO_HOLD:9}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  health:
+    probes:
+      enabled: true
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: ${spring.application.name}
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [correlationId=%X{correlationId:-none}] %logger{36} - %msg%n"
+  level:
+    com.aiops.ledger: INFO
