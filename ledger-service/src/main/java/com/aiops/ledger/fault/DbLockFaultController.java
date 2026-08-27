@@ -1,5 +1,6 @@
 package com.aiops.ledger.fault;
 
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -25,5 +26,18 @@ public class DbLockFaultController {
     @PostMapping("/reset-db-lock")
     public DbLockFaultService.ResetResult reset() {
         return dbLockFaultService.reset();
+    }
+
+    /**
+     * Read-only status check for the telemetry collector (Week 5) - does not acquire or release
+     * any connections.
+     */
+    @GetMapping("/fault-status")
+    public FaultStatus status() {
+        boolean active = dbLockFaultService.isEnabled();
+        return new FaultStatus(active, dbLockFaultService.getHeldConnectionCount());
+    }
+
+    public record FaultStatus(boolean faultActive, int connectionsHeld) {
     }
 }

@@ -5,6 +5,24 @@ rules and weekly roadmap.
 
 ## Status
 
+Week 6 complete: `dataset-tools/` (Python) turns Week 5's raw telemetry
+into a 68-incident labeled dataset (16 real, 52 deterministic synthetic —
+both clearly labeled, never conflated), splits it deterministically
+(seed 42, stratified by fault type) into a 20-incident Memory set and a
+48-incident Evaluation set, and builds a local, persistent ChromaDB
+collection from the Memory set only. The Evaluation/Memory separation is
+enforced in code (ChromaDB's indexing path never opens the Evaluation
+file, and independently double-checks for ID overlap before and after
+indexing), not just by convention. See `dataset-tools/README.md` for the
+full architecture, schema, and how to reproduce it.
+
+Week 5 complete: an automated telemetry collector (`telemetry/`, Python)
+continuously captures health, curated Prometheus metrics, fault state, and
+synthetic end-to-end payment attempts from all four services into
+structured JSONL files, and can orchestrate a full NORMAL → FAULT →
+RECOVERY experiment against any of the four controlled faults. See
+`telemetry/README.md` for the full design, schema, and how to run it.
+
 Week 4 complete: all four services expose Spring Boot Actuator + Prometheus
 metrics, Prometheus itself runs in-cluster scraping all four, Kubernetes
 readiness/liveness probes are live on all four app Deployments, and all
@@ -67,7 +85,7 @@ Endpoints:
 
 Configuration (env vars): `SERVER_PORT` (8081), `JWT_SECRET` (dev-only default — override outside local dev), `JWT_EXPIRATION_MS` (3600000).
 
-**Fault injection** (disabled by default — see "Fault injection" below): `POST /inject-auth-key-error`, `POST /reset-auth-key`.
+**Fault injection** (disabled by default — see "Fault injection" below): `POST /inject-auth-key-error`, `POST /reset-auth-key`, `GET /fault-status` (read-only, added Week 5 for the telemetry collector).
 
 ### ledger-service (port 8083)
 
@@ -89,7 +107,7 @@ Endpoints:
 
 Configuration (env vars): `SERVER_PORT` (8083), `DB_URL`, `DB_USERNAME`, `DB_PASSWORD`, `DB_POOL_MAX_SIZE` (10 — matches the Week 4 HikariCP fault-injection spec), `SEED_DEMO_ACCOUNT`.
 
-**Fault injection** (disabled by default): `POST /inject-db-lock`, `POST /reset-db-lock` — holds up to `DB_LOCK_CONNECTIONS_TO_HOLD` (default 9, always clamped below the pool max) raw connections from the pool.
+**Fault injection** (disabled by default): `POST /inject-db-lock`, `POST /reset-db-lock`, `GET /fault-status` — holds up to `DB_LOCK_CONNECTIONS_TO_HOLD` (default 9, always clamped below the pool max) raw connections from the pool.
 
 ### notification-service (port 8084)
 
@@ -102,7 +120,7 @@ Endpoint:
 
 Configuration (env vars): `SERVER_PORT` (8084).
 
-**Fault injection** (disabled by default): `POST /inject-latency` (optional body `{"delayMs": N}`, default `NOTIFICATION_LATENCY_DEFAULT_DELAY_MS`=6000), `POST /reset-latency`.
+**Fault injection** (disabled by default): `POST /inject-latency` (optional body `{"delayMs": N}`, default `NOTIFICATION_LATENCY_DEFAULT_DELAY_MS`=6000), `POST /reset-latency`, `GET /fault-status`.
 
 ### payment-service (port 8082)
 
@@ -124,7 +142,7 @@ Endpoint:
 
 Configuration (env vars): `SERVER_PORT` (8082), `AUTH_SERVICE_URL`, `LEDGER_SERVICE_URL`, `NOTIFICATION_SERVICE_URL` (+ matching `*_TIMEOUT_MS` for each, default 5000).
 
-**Fault injection** (disabled by default): `POST /inject-memory-leak`, `POST /reset-memory-leak` — retains `MEMORY_LEAK_CHUNK_SIZE_BYTES` (default 5MB) chunks every `MEMORY_LEAK_INTERVAL_MS` (default 1s), hard-capped at `MEMORY_LEAK_MAX_TOTAL_BYTES` (default 200MB).
+**Fault injection** (disabled by default): `POST /inject-memory-leak`, `POST /reset-memory-leak`, `GET /fault-status` — retains `MEMORY_LEAK_CHUNK_SIZE_BYTES` (default 5MB) chunks every `MEMORY_LEAK_INTERVAL_MS` (default 1s), hard-capped at `MEMORY_LEAK_MAX_TOTAL_BYTES` (default 200MB).
 
 ### Observability (Actuator + Prometheus)
 
@@ -312,6 +330,37 @@ Tear down: `kubectl delete -f k8s/` (the PVC and its data persist unless
 you also `kubectl delete pvc postgres-pvc`). `minikube stop` pauses the
 cluster; `minikube delete` removes it entirely.
 
+## Telemetry collection (Week 5)
+
+A standalone Python collector (`telemetry/`) continuously captures health,
+curated Prometheus metrics, fault state, and synthetic payment attempts
+from all four services into JSONL files, and can run a full NORMAL →
+FAULT → RECOVERY experiment against any of the four faults. It works
+unmodified against native, Docker Compose, or Kubernetes (via
+`kubectl port-forward` + env vars). Full details, data schema, and
+commands: see [`telemetry/README.md`](telemetry/README.md).
+
+```bash
+cd telemetry
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+python -m telemetry.experiment notification-latency --baseline-seconds 30 --fault-seconds 30 --recovery-seconds 30
+```
+
+## Dataset construction and ChromaDB retrieval memory (Week 6)
+
+`dataset-tools/` builds the incident dataset used for RAG-based root-cause retrieval, from Week
+5's raw telemetry. Full details: [`dataset-tools/README.md`](dataset-tools/README.md).
+
+```bash
+cd dataset-tools
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && pip install -e .
+
+python -m dataset_tools.build_dataset   # reconstruct real + generate synthetic incidents, split
+python -m dataset_tools.chroma_store    # build the ChromaDB collection (Memory set only)
+python -m dataset_tools.chroma_store query "payment service returning errors after auth failure"
+```
+
 ## Testing
 
 ```bash
@@ -326,3 +375,18 @@ three downstream services, so they don't require any other service to be
 running. `ledger-service`'s tests run against a real PostgreSQL database
 (`ledger_db_test`), each wrapped in a rolled-back transaction so the schema
 stays clean between runs.
+
+```bash
+cd telemetry && source .venv/bin/activate && python -m pytest tests/ -v
+```
+
+The telemetry collector's tests (19) mock all HTTP calls (via `responses`)
+and don't require any service to be running.
+
+```bash
+cd dataset-tools && source .venv/bin/activate && python -m pytest tests/ -v
+```
+
+`dataset-tools`' tests (42) use a real local ChromaDB `PersistentClient`
+against an isolated `tmp_path` per test - nothing is mocked - and don't
+require any of the four microservices to be running.

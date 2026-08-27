@@ -1,5 +1,6 @@
 package com.aiops.notification.fault;
 
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
@@ -28,6 +29,15 @@ public class LatencyFaultController {
     public FaultStatus reset() {
         latencyFaultState.reset();
         return status("Notification latency fault reset.");
+    }
+
+    /**
+     * Read-only status check for the telemetry collector (Week 5) - does not trigger or change
+     * the fault in any way.
+     */
+    @GetMapping("/fault-status")
+    public FaultStatus status() {
+        return status(latencyFaultState.isEnabled() ? "Notification latency fault is active." : "Notification latency fault is inactive.");
     }
 
     private FaultStatus status(String message) {

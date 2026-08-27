@@ -1,0 +1,7 @@
+requests>=2.31
+chromadb>=0.5
+prometheus-client>=0.20  # needed transitively: generate.py imports telemetry.experiment, which imports telemetry.collector
+
+# test-only
+pytest>=8.0
+responses>=0.25

@@ -1,5 +1,6 @@
 package com.aiops.payment.fault;
 
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -27,6 +28,15 @@ public class MemoryLeakFaultController {
     public FaultStatus reset() {
         memoryLeakFaultService.reset();
         return status("Memory leak fault reset.");
+    }
+
+    /**
+     * Read-only status check for the telemetry collector (Week 5) - does not trigger or change
+     * the fault in any way.
+     */
+    @GetMapping("/fault-status")
+    public FaultStatus status() {
+        return status(memoryLeakFaultService.isEnabled() ? "Memory leak fault is active." : "Memory leak fault is inactive.");
     }
 
     private FaultStatus status(String message) {

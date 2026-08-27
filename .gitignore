@@ -9,6 +9,7 @@ target/
 *.iml
 .vscode/
 .DS_Store
+.claude/
 
 # Python
 __pycache__/
@@ -16,6 +17,16 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.pytest_cache/
+
+# Week 5 telemetry - captured data is a generated artifact, not source
+telemetry/data/
+
+# Week 6 dataset-tools - the incident dataset and ChromaDB store are both reproducible from
+# telemetry/data/ via `python -m dataset_tools.build_dataset` + `chroma_store`, given the fixed
+# seed in config.py - generated artifacts, not source
+dataset-tools/data/
+dataset-tools/chroma/
 
 # Environment / secrets
 .env

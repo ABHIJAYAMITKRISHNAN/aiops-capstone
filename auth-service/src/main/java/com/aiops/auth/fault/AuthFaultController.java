@@ -1,6 +1,7 @@
 package com.aiops.auth.fault;
 
 import com.aiops.auth.security.JwtSigningKeyProvider;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -29,6 +30,16 @@ public class AuthFaultController {
     public FaultStatus reset() {
         signingKeyProvider.reset();
         return new FaultStatus(false, "Auth key error fault reset. Original JWT key restored.");
+    }
+
+    /**
+     * Read-only status check for the telemetry collector (Week 5) - does not trigger or change
+     * the fault in any way. Exposes no key material, just whether the fault is currently active.
+     */
+    @GetMapping("/fault-status")
+    public FaultStatus status() {
+        boolean active = signingKeyProvider.isFaultActive();
+        return new FaultStatus(active, active ? "Auth key error fault is active." : "Auth key error fault is inactive.");
     }
 
     public record FaultStatus(boolean faultActive, String message) {

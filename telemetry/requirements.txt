@@ -1,0 +1,6 @@
+requests>=2.31
+prometheus-client>=0.20
+
+# test-only
+pytest>=8.0
+responses>=0.25
