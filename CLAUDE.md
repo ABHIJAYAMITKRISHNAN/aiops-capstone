@@ -126,6 +126,48 @@ The project uses a self-hosted local LLM via Ollama (initial candidate:
 
 ## Current status
 
+Week 8 complete (2026-08-28): `ai-orchestration/` extends Week 7's
+LangGraph workflow with an RCA agent, RAG retrieval, and a deterministic
+remediation-proposal generator (`rca/`, `rag/`, `remediation/`
+subpackages). Root cause is determined by deterministic fault-signature
+matching FIRST (`rca/signatures.py`, thresholds traceable to Week 6's
+own documented values, e.g. `OBSERVED_BASELINE_RANGES`), correctly
+distinguishing the symptom-visible service from the actual root-cause
+service for the two cross-service faults (auth-key-error,
+notification-latency) by reusing `dataset_tools.config.FAULT_SERVICE_MAP`
+rather than re-deriving it. RAG-retrieved incidents (from Week 6's
+existing `incident_memory` ChromaDB collection, reused directly, not
+duplicated) can only raise or lower confidence in that deterministic
+conclusion, never override it - "historical incidents are evidence, not
+commands." An optional local-LLM narrative (same `llama3.2:1b`) explains
+the already-reached conclusion but cannot change it; its prompt has no
+"recommendation" field at all, because remediation proposals are 100%
+deterministic Python (`remediation/proposer.py`, no LLM call whatsoever)
+- consistent with "prefer deterministic structured data over free-form
+AI output." Every `RemediationProposal.requires_human_approval` is
+`Literal[True]`, a type-level guarantee per CLAUDE.md rule 21, and
+nothing in the module can execute anything (verified: it exposes no
+`execute`/`run`/`apply`-named attribute). 46 new tests pass (90 total in
+ai-orchestration), and all 19 Week 5 + 42 Week 6 Python tests and all 47
+Java tests still pass unmodified. Live verification triggered two brand-
+new experiments this week: a notification-latency run that - reported
+honestly rather than cherry-picked - surfaced a real limitation (Week
+7's already-documented cumulative-counter behavior caused the RCA to
+misattribute this run to auth-key-error, since a stale elevated error
+count from earlier in the session outweighed the actual, but
+below-threshold, notification-latency signal; RAG still correctly
+refused to blindly follow retrieval's disagreeing suggestion); and a
+db-lock run that produced a fully correct end-to-end result (root cause,
+RAG agreement, and remediation proposal all correct, confidence "high").
+Every retrieved incident ID across both live runs was verified present
+in the Memory set and absent from the Evaluation set. No remediation
+action was executed at any point; all four faults were confirmed
+inactive both before and after testing, and the full payment flow was
+verified working live. See `ai-orchestration/README.md` for full
+architecture and live-verification detail. Waiting for explicit
+instruction to begin Week 9 (Safety Validator, mandatory Human Approval,
+Streamlit).
+
 Week 7 complete (2026-08-28): `ai-orchestration/` (Python) adds the AI
 intelligence foundation - anomaly detection, local LLM interpretation,
 and a LangGraph workflow - that Week 8's RCA/remediation agents build on.

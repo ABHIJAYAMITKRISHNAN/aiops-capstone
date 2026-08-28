@@ -5,6 +5,23 @@ rules and weekly roadmap.
 
 ## Status
 
+Week 8 complete: `ai-orchestration/` extends Week 7's LangGraph workflow
+with an RCA agent, RAG retrieval against Week 6's ChromaDB Memory
+collection, and a deterministic remediation-proposal generator - Week 8
+never executes anything (`RemediationProposal.requires_human_approval`
+is `True` at the type level, permanently). RCA determines root cause via
+deterministic fault-signature matching first (correctly distinguishing
+symptom-visible service from actual root-cause service for the two
+cross-service faults), cross-checked against - but never overridden by -
+retrieved historical incidents, with an optional LLM narrative that
+cannot change the conclusion. Live-verified against brand-new
+notification-latency and db-lock experiments this week; the
+notification-latency run surfaced and honestly documents a real
+limitation (a cumulative-counter artifact caused one RCA
+misattribution), while the db-lock run produced a fully correct
+end-to-end result. See `ai-orchestration/README.md` for full
+architecture and live-verification detail.
+
 Week 7 complete: `ai-orchestration/` (Python) adds the AI intelligence
 foundation - one Isolation Forest per service trained on Memory-eligible
 real baseline telemetry (never Evaluation-set data, enforced in code), a
@@ -372,11 +389,13 @@ python -m dataset_tools.chroma_store    # build the ChromaDB collection (Memory 
 python -m dataset_tools.chroma_store query "payment service returning errors after auth failure"
 ```
 
-## AI orchestration foundation (Week 7)
+## AI orchestration: anomaly detection, RCA, RAG, remediation proposals (Weeks 7-8)
 
 `ai-orchestration/` trains per-service anomaly detectors, interprets anomalies via a local Ollama
-model, and runs both through a LangGraph workflow. Full details:
-[`ai-orchestration/README.md`](ai-orchestration/README.md).
+model, then (Week 8) runs a root-cause analysis against the anomaly evidence, retrieves similar
+historical incidents from Week 6's ChromaDB Memory collection, and generates a structured
+remediation *proposal* - never executes it. All of this runs through one LangGraph workflow. Full
+details: [`ai-orchestration/README.md`](ai-orchestration/README.md).
 
 ```bash
 cd ai-orchestration
@@ -423,5 +442,7 @@ require any of the four microservices to be running.
 cd ai-orchestration && source .venv/bin/activate && python -m pytest tests/ -v
 ```
 
-`ai-orchestration`'s tests (44) mock Ollama and require no running
-Kubernetes cluster, payment system, or Ollama server.
+`ai-orchestration`'s tests (90 - 44 Week 7 + 46 Week 8) mock Ollama and
+use a real, isolated local ChromaDB (never the project's real Memory
+collection) for RAG tests. None require a running Kubernetes cluster,
+payment system, or Ollama server.

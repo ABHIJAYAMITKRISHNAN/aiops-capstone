@@ -1,7 +1,9 @@
-# Week 7 — AI Intelligence Foundation
+# Weeks 7-8 — AI Intelligence Foundation, RCA, RAG, and Remediation Proposals
 
-Anomaly detection (Isolation Forest), a local LLM interpretation step (Ollama), and a LangGraph
-workflow that ties them together - the foundation Week 8's RCA and remediation agents build on.
+Week 7: anomaly detection (Isolation Forest), a local LLM interpretation step (Ollama), and a
+LangGraph workflow. Week 8 extends that same workflow with an RCA agent, RAG retrieval against
+Week 6's ChromaDB Memory collection, and a deterministic remediation-proposal generator - Week 8
+**never executes anything**; see "Week 8 architecture" below.
 
 ## Architecture
 
@@ -9,20 +11,30 @@ workflow that ties them together - the foundation Week 8's RCA and remediation a
 ai-orchestration/
 ├── src/ai_orchestration/
 │   ├── config.py              paths, env vars, per-service feature schema, IF hyperparameters
-│   ├── anomaly/
+│   ├── anomaly/                (Week 7)
 │   │   ├── models.py           FeatureVector, ModelMetadata, AnomalyResult dataclasses
 │   │   ├── feature_extractor.py  raw telemetry -> FeatureVector; Memory-eligible baseline selection
 │   │   ├── detector.py          AnomalyDetector: train/save/load/score, one per service
 │   │   └── train.py             CLI: trains + persists all 4 services' detectors
-│   ├── llm/
+│   ├── llm/                    (Week 7, extended Week 8)
 │   │   ├── models.py            AnomalyInterpretation dataclass
 │   │   ├── ollama_client.py      thin REST client (no SDK), availability check, timeouts
-│   │   ├── prompts.py            builds the evidence-only interpretation prompt
+│   │   ├── prompts.py            interpretation prompt (Week 7) + RCA narrative prompt (Week 8)
 │   │   └── interpret.py           orchestrates client+prompt, graceful degradation
+│   ├── rag/                    (Week 8) - RAG retrieval against Week 6's ChromaDB
+│   │   ├── models.py            RetrievedIncident, RetrievalResult (Pydantic)
+│   │   └── retriever.py          query construction + dataset_tools.chroma_store.query_similar()
+│   ├── rca/                    (Week 8) - root cause analysis
+│   │   ├── models.py            MetricAnomaly, RCAEvidence, RootCauseAnalysis (Pydantic)
+│   │   ├── signatures.py         deterministic fault-signature matching (documented thresholds)
+│   │   └── analyzer.py           ties signatures + RAG + optional LLM narrative together
+│   ├── remediation/            (Week 8) - proposals only, never executes
+│   │   ├── models.py            RemediationProposal (Pydantic)
+│   │   └── proposer.py           deterministic fault_type -> action mapping, no LLM involved
 │   └── graph/
 │       ├── state.py              WorkflowState (explicit TypedDict)
 │       └── workflow.py            the LangGraph itself - see "The graph" below
-├── tests/                      44 pytest tests (see "Testing")
+├── tests/                      90 pytest tests (see "Testing")
 ├── models/                     trained IsolationForest + metadata per service (gitignored, generated)
 ├── requirements.txt
 └── pyproject.toml
@@ -30,7 +42,8 @@ ai-orchestration/
 
 Reuses Week 5/6 code directly (`telemetry`, `dataset_tools`) via the same `sys.path` insertion
 pattern `dataset-tools/src/dataset_tools/generate.py` already established - no duplication of
-JSONL loading or phase-reconstruction logic.
+JSONL loading, phase-reconstruction, or ChromaDB setup logic. `rag/retriever.py` calls
+`dataset_tools.chroma_store.query_similar()` directly rather than opening a second collection.
 
 ## Feature schema
 
@@ -183,6 +196,12 @@ raw telemetry record
 normal       anomaly
   |             |
   |        interpret (Ollama)
+  |             |
+  |     retrieve_similar_incidents (ChromaDB, Memory-set only)
+  |             |
+  |     root_cause_analysis (deterministic signature match + RAG cross-check + optional LLM narrative)
+  |             |
+  |     propose_remediation (deterministic - no LLM, never executes)
    \           /
      finalize
         |
@@ -192,38 +211,122 @@ normal       anomaly
 Built with real LangGraph (`langgraph.graph.StateGraph`), explicit typed state
 (`graph/state.py`'s `WorkflowState`), and a real conditional edge
 (`add_conditional_edges` on `_route_after_detection`) - not a fake linear stand-in. **The LLM is
-only ever invoked on the anomaly branch** - a normal reading never calls Ollama (verified in
-`tests/test_workflow.py::test_workflow_normal_path_never_calls_llm`, which asserts the mock client
-is never called).
+only ever invoked on the anomaly branch, and RAG/RCA/remediation only ever run on the anomaly
+branch too** - a normal reading never calls Ollama, never queries ChromaDB, and never produces an
+RCA or remediation proposal (verified in `tests/test_workflow.py::test_workflow_normal_path_never_calls_llm`,
+which asserts the mock LLM client is never called *and* that a `retrieve_similar_incidents` spy
+that raises on any call is never triggered).
 
 `build_graph(detectors, ollama_client)` takes both dependencies as parameters rather than
 constructing them internally - models are loaded once (`load_all_detectors()`) and reused across
 every `graph.invoke()` call, and tests can inject fakes/mocks for both.
 
 The final `result` dict (present on every path, not just the anomaly one) contains:
-`correlation_id`, `incident_id` (caller-supplied, for Week 8 to correlate against), `service`,
-`timestamp`, `decision`, `telemetry_evidence` (the raw metrics/fault/collection_error), the full
-`anomaly_result`, `llm_interpretation` (`None` on the normal path), and `limitations` (plain-text
-notes for any degraded condition - insufficient data, no model, LLM unavailable/error).
+`correlation_id`, `incident_id`, `service`, `timestamp`, `decision`, `telemetry_evidence` (the raw
+metrics/fault/collection_error), the full `anomaly_result`, `llm_interpretation` (Week 7),
+`retrieval`, `root_cause_analysis`, `remediation_proposal` (Week 8 - all three `None` on the
+normal/insufficient_data/no_model paths), and `limitations` (plain-text notes for any degraded
+condition across the whole pipeline).
 
-## How Week 7 feeds Week 8
+## Week 8 architecture: RCA, RAG, and remediation proposals
 
-- `build_graph()` + `load_all_detectors()` are the entry points Week 8's orchestrator calls per
-  telemetry record; the `result` dict is Week 8's input.
-- The graph is deliberately not more than this. Week 8 adds nodes **after** the `anomaly` branch:
+### RCA design (`rca/`)
 
-  ```
-  ... detect_anomaly -> (anomaly) -> RCA Agent -> RAG Retrieval -> Remediation Proposal -> ...
-  ```
+`RootCauseAnalysis` (Pydantic, `rca/models.py`) is never solely reliant on free-form LLM text.
+Precedence, deliberately in this order:
 
-  It can do this by adding new nodes and re-wiring the edge currently going `interpret -> finalize`
-  to `interpret -> rca_agent -> rag_retrieval -> remediation_proposal -> finalize`, without
-  touching `extract_features`, `detect_anomaly`, or the routing logic upstream of it.
-- RAG retrieval already has its data ready: `dataset-tools/chroma`'s `incident_memory` collection
-  (Memory-set incidents only, built in Week 6) is what Week 8's RAG Retrieval node will query -
-  Week 7 doesn't touch or duplicate it, keeping ChromaDB access exactly where Week 6 put it.
-- `incident_id` is already threaded through the whole graph's state and final result, ready for
-  Week 8 to attach retrieved incidents and a remediation proposal to.
+1. **Deterministic fault-signature matching** (`rca/signatures.py`) always runs first and always
+   wins when it matches. Each of the four known faults has one documented "primary metric" and
+   threshold (reusing `dataset_tools.incidents._primary_metric_key` - Week 6's own mapping, not
+   re-derived), with every threshold traceable to a real, documented value (`OBSERVED_BASELINE_RANGES`
+   for JVM memory, empirically-verified real baselines of 0 for HikariCP/error counts, a value well
+   below the real `client_timeout_ms` for notification latency). This is exactly what distinguishes
+   symptom from root cause for the two cross-service faults: `auth-key-error`'s and
+   `notification-latency`'s signatures are both keyed to **payment-service's own telemetry**
+   (where the symptom is measured) but resolve to **auth-service**/**notification-service** as
+   `suspected_root_cause_service` via `dataset_tools.config.FAULT_SERVICE_MAP` (reused, not
+   duplicated) - see `tests/test_signatures.py` and `tests/test_rca_analyzer.py` for the explicit
+   symptom-vs-root-cause assertions.
+2. **RAG-retrieved incidents can only raise/lower confidence, never override step 1.** If
+   retrieved incidents' `fault_type` metadata agrees with the signature match, confidence rises to
+   `"high"`. If they disagree, the signature's conclusion is kept and the disagreement is recorded
+   in `evidence_summary` (`determination_method="metric_signature+rag_disagreement"`) - "the agent
+   must not blindly trust retrieved incidents" per the Week 8 spec. When no signature matched at
+   all, the single closest retrieved incident is used as a *low-confidence* suggestion instead
+   (`"rag_only"`); with neither a signature match nor useful retrieval, `suspected_fault_type` is
+   `None` and the root cause defaults to the symptom-visible service itself
+   (`"fallback_unknown"`) - never a fabricated guess.
+3. **The LLM only narrates the conclusion already reached by 1-2** - it is never asked to
+   determine the root cause, and its response schema has no field for one (see
+   `llm/prompts.py::build_rca_reasoning_prompt`, which explicitly instructs "you are NOT being
+   asked to determine the root cause yourself"). Its two-key JSON response
+   (`observed_evidence`/`inference`) implements the "OBSERVED EVIDENCE / INFERENCE" split the spec
+   asks for; there is no `recommendation` key at all, because remediation is never LLM-authored
+   (see below). Degrades identically to Week 7's `interpret_anomaly()` - unavailable/timeout/
+   malformed JSON all just leave `llm_reasoning=None`, never an exception, and never change the
+   deterministic conclusion (verified: `test_llm_reasoning_is_none_when_ollama_unavailable`
+   explicitly asserts `suspected_root_cause_service` is unaffected).
+
+### RAG design (`rag/`)
+
+`rag/retriever.py` calls `dataset_tools.chroma_store.query_similar()` directly - no second
+ChromaDB collection, no re-embedding. `build_query_text()` builds a natural-language-style query
+(deliberately similar in shape to the postmortem prose actually indexed) from the anomaly's
+service, its most notable metric values, and Week 7's `llm_interpretation.abnormal_summary` when
+available. Results become typed `RetrievedIncident`s (incident ID, distance, fault type, root
+cause/symptom service, severity, data source, and a postmortem excerpt) inside a `RetrievalResult`
+with an explicit `status` (`"retrieved"` / `"empty"` / `"collection_unavailable"`) - never a bare
+exception reaching the graph.
+
+### Remediation design (`remediation/`)
+
+`remediation/proposer.py` is **100% deterministic Python - no LLM call at all**. This is
+deliberate: the project's own rules already say to prefer deterministic structured data over
+free-form AI output, and remediation is exactly the place where that matters most. A
+`RemediationProposal` (Pydantic, `remediation/models.py`) is returned for every anomaly, with
+`requires_human_approval: Literal[True] = True` - a type-level guarantee (Pydantic rejects any
+attempt to construct one with `False`), citing CLAUDE.md's permanent rule 21. **Nothing in this
+module calls Kubernetes, a fault-injection endpoint, or any other side-effecting API** - a
+`RemediationProposal` is inert data (`tests/test_remediation_proposer.py::test_proposal_has_no_executable_side_effects`
+checks it exposes no `execute`/`run`/`apply`/`invoke_*`-named attribute at all). Fault-name lookup
+templates exist for the four known faults, but are only used when the RCA's own `confidence` is at
+least `"medium"` - a `"low"`-confidence RCA (regardless of which `fault_type` was merely suspected)
+always falls back to a generic, low-risk `"investigate_manually"` proposal instead, per "do not
+hardcode the final answer solely based on fault names."
+
+## How Week 8 feeds Week 9
+
+- `build_graph()` + `load_all_detectors()` are still the entry points; the `result` dict (now
+  including `retrieval`, `root_cause_analysis`, `remediation_proposal`) is Week 9's input.
+- Week 9 adds mandatory human approval and Streamlit around the `remediation_proposal` this graph
+  already produces - nothing here needs to change for that; `requires_human_approval` is already
+  always `True` at the type level, so Week 9's approval gate has a guaranteed non-optional signal
+  to gate on.
+- `incident_id` and `correlation_id` are threaded through every node's state, ready for Week 9/10
+  to write investigation outcomes back for future incident retrieval (CLAUDE.md's roadmap item for
+  Week 10 - "feedback write-back").
+- `retrieval.incidents` already carries each historical incident's own outcome fields where
+  present in the incident schema, ready for a future week to compare "did the same remediation
+  work last time" without any retrieval-layer changes.
+
+## Running a local investigation
+
+Requires: a trained model per service (`python -m ai_orchestration.anomaly.train`), a built
+ChromaDB Memory collection (`cd dataset-tools && python -m dataset_tools.chroma_store`), and
+optionally a running Ollama server (`ollama serve`, model pulled) - the pipeline still produces a
+full, deterministic result without Ollama, just with `llm_interpretation`/`llm_reasoning` set to
+`None`/`"llm_unavailable"`.
+
+```python
+from ai_orchestration.graph.workflow import build_graph, load_all_detectors
+from ai_orchestration.llm.ollama_client import OllamaClient
+
+graph = build_graph(load_all_detectors(), OllamaClient())
+
+raw_record = {...}  # one record exactly as telemetry/collector.py's collect_service() produces
+final_state = graph.invoke({"raw_record": raw_record, "incident_id": None})
+print(final_state["result"])  # decision, anomaly_result, retrieval, root_cause_analysis, remediation_proposal
+```
 
 ## Testing
 
@@ -231,47 +334,84 @@ notes for any degraded condition - insufficient data, no model, LLM unavailable/
 cd ai-orchestration && source .venv/bin/activate && python -m pytest tests/ -v
 ```
 
-44 tests, mocking Ollama (`responses` for the HTTP client, `unittest.mock.MagicMock` for the
-higher-level `interpret_anomaly()`/graph tests) and requiring no running Kubernetes cluster,
-payment system, or Ollama server:
+90 tests (44 from Week 7 + 46 new this week), mocking Ollama (`responses` for the HTTP client,
+`unittest.mock.MagicMock` for higher-level tests) and using a real, isolated local ChromaDB
+(`tmp_path`-scoped, same pattern as `dataset-tools/tests/test_chroma_store.py`) for RAG tests -
+never the project's real Memory collection, and requiring no running Kubernetes cluster, payment
+system, or Ollama server:
 
-- `test_feature_extractor.py` (8) - feature extraction; missing/non-applicable metrics never
-  treated as errors.
-- `test_baseline_selection.py` (4) - Memory/Evaluation training-data separation.
-- `test_detector.py` (10) - training, inference, save/load round-trip, feature-schema mismatch
-  detection, normal-telemetry scoring, extreme/fault-like-telemetry scoring.
-- `test_ollama_client.py` (10) + `test_interpret.py` (7) - availability, timeouts, connection
-  errors, malformed/incomplete JSON, graceful degradation end-to-end.
-- `test_workflow.py` (5) - LangGraph normal path (never calls the LLM), anomaly path (calls the
-  LLM, includes its interpretation), Ollama-unavailable-on-the-anomaly-path degradation,
-  insufficient-data path, no-model path.
+- `test_feature_extractor.py` (8), `test_baseline_selection.py` (4), `test_detector.py` (10),
+  `test_ollama_client.py` (10), `test_interpret.py` (7) - unchanged from Week 7.
+- `test_signatures.py` (9, new) - each of the four faults' signature match, including the two
+  symptom-vs-root-cause cross-service cases, ranking multiple simultaneous matches, and documented
+  baseline references.
+- `test_rca_analyzer.py` (12, new) - all four faults' end-to-end RCA identification, RAG
+  agreement/disagreement behavior, `rag_only`/`fallback_unknown` fallback, and LLM
+  narrative graceful degradation.
+- `test_rag_retriever.py` (9, new) - real isolated-ChromaDB retrieval, Evaluation-incident
+  exclusion (both "never built into the collection" and "even if a match somehow returned one,
+  filtered before reaching RCA"), empty/no-result, and malformed-match handling.
+- `test_remediation_proposer.py` (13, new) - a proposal for each of the four faults, the
+  low-confidence fallback, Pydantic validation of risk/action-category/`requires_human_approval`,
+  and the no-executable-attributes check.
+- `test_workflow.py` (7, 2 new + 5 extended) - normal path still reaches none of Week 8's new
+  nodes; anomaly path reaches RCA, retrieval, and remediation; Ollama-unavailable degrades the
+  whole extended pipeline gracefully (RCA/remediation still populate, just without a narrative);
+  RAG agreement raises RCA confidence to `"high"` end-to-end through the compiled graph.
 
-Also re-run as part of Week 7 verification: all 19 Week 5 telemetry tests, all 42 Week 6
+Also re-run as part of Week 8 verification: all 19 Week 5 telemetry tests, all 42 Week 6
 dataset-tools tests, all 47 Java tests - all still pass unmodified.
 
 ## Live verification performed
 
-Against the real Kubernetes deployment (Colima + Minikube) and a real local Ollama server:
+Against the real Kubernetes deployment (Colima + Minikube) and a real local Ollama server.
 
-1. Trained all 4 services' Isolation Forests on real Memory-eligible telemetry (42-45 samples
-   each) - `python -m ai_orchestration.anomaly.train`.
-2. Installed Ollama via Homebrew, pulled `llama3.2:1b` (1.3GB - chosen for this machine's ~8.8GB
-   free disk; see "Ollama integration" above), started the server, confirmed
-   `OllamaClient.is_available()` and `.has_model()` both return `True`.
-3. Ran a full `graph.invoke()` end-to-end against a deliberately extreme synthetic record with a
-   live Ollama server: correctly routed to the anomaly branch, correctly called Ollama (7.3s
-   round-trip), got back a structured, schema-valid `AnomalyInterpretation` (`status="interpreted"`,
-   confidence self-reported as `"low"` by the small model - a reasonable, honest self-assessment
-   given the limited context it was given, not a wrong answer).
-4. Confirmed all 4 faults inactive, ran a **new, live** memory-leak experiment
-   (baseline=15s/fault=20s/recovery=15s) against the real system, collected fresh telemetry, and
-   scored every record through the trained payment-service detector: anomaly scores trended upward
-   as `jvm_memory_used_bytes` climbed through the fault window (23MB→108MB), with the later
-   fault-active samples correctly flagged `is_anomaly=True`, and flagging correctly persisted into
-   the RECOVERY phase's early samples too (memory stays elevated immediately after reset - matches
-   Week 5/6's documented "reset stops new allocation but doesn't force immediate GC" behavior).
-5. Confirmed the full payment flow (login → payment → ledger debit → notification) still works
-   end-to-end via a live HTTP call, and all 4 faults are inactive after testing.
+**Week 7** (repeated this week to confirm no regression): trained all 4 services' Isolation
+Forests (`python -m ai_orchestration.anomaly.train`); confirmed Ollama + `llama3.2:1b` available;
+ran a full `graph.invoke()` against a deliberately extreme record with a live Ollama server
+(anomaly correctly flagged, LLM interpretation returned); triggered a live memory-leak experiment
+and confirmed anomaly scores tracked real memory growth.
+
+**Week 8, this week:**
+
+1. Confirmed Kubernetes healthy (6/6 pods) and all four faults inactive before starting.
+2. Ran a **brand-new live `notification-latency` experiment**. Among its FAULT_ACTIVE-phase
+   telemetry, one record (`http_client_requests_avg_duration_ms=74.5ms`) was flagged anomalous by
+   the trained detector; running it through the full graph correctly reached `interpret` →
+   `retrieve_similar_incidents` → `root_cause_analysis` → `propose_remediation`. **This run
+   surfaced a genuine, honestly-reported finding**: the RCA's signature match picked
+   `"auth-key-error"` instead of `"notification-latency"`, because `http_server_requests_error_count`
+   had accumulated to `22` over this long-running session (the same cumulative-counter behavior
+   Week 7 already documented) - `22` cleared the auth-key-error threshold by a much larger margin
+   (44x) than this record's `http_client_requests_avg_duration_ms=74.5ms` cleared
+   notification-latency's threshold (it didn't clear it at all - 74.5 is below the 500ms
+   threshold). RAG retrieval correctly found real/synthetic `memory-leak` Memory incidents
+   (semantically close given the JVM metrics in the query), and the RCA's own logic correctly
+   recognized the disagreement and did *not* blindly follow retrieval
+   (`determination_method="metric_signature+rag_disagreement"`) - but the underlying signature
+   match itself was still wrong, for the reason above. See "Known limitations" for what this means
+   and the reasonable fix direction (not implemented this week).
+3. Ran a **brand-new live `db-lock` experiment** (a clean resource-fault case, since
+   `hikaricp_connections_active` is a gauge, not a cumulative counter). A FAULT_ACTIVE record
+   (`hikaricp_connections_active=9.0`) was flagged anomalous; the full pipeline produced a
+   **correct, clean result end-to-end**: `suspected_fault_type="db-lock"`,
+   `suspected_root_cause_service="ledger-service"` (matches `symptom_service` - both correctly
+   ledger-service, a same-service fault), 3/3 retrieved incidents agreed
+   (`determination_method="metric_signature+rag_agreement"`, `confidence="high"`), and the
+   remediation proposal correctly targeted `ledger-service` with `action_category="release_resources"`,
+   `requires_human_approval=True`. The LLM's narrative text was imperfect in places (a 1B-parameter
+   model summarizing "9.0" as "5 raw JDBC connections" in one sentence) - an honest limitation of
+   using a very small local model for narration, not a pipeline defect, since the narrative field
+   never feeds back into the deterministic conclusion.
+4. Verified (both experiments): every retrieved incident ID (`inc-0037`, `inc-0042`, `inc-0044`,
+   `inc-0022`, `inc-0032`, `inc-0029`) is present in `memory_incidents.jsonl` and absent from
+   `evaluation_incidents.jsonl` - no Evaluation incident was ever retrieved or used as context.
+5. Confirmed no remediation action was executed: `RemediationProposal` objects were only ever
+   constructed and printed/inspected; the only fault-injection API calls made during this
+   verification were the experiment orchestrator's own scripted inject/reset calls (Week 5's
+   `telemetry.experiment`), not anything triggered by a proposal.
+6. Confirmed all four faults inactive after testing, and the full payment flow (login → payment →
+   ledger debit → notification) still works end-to-end via a live HTTP call.
 
 ## Known limitations
 
@@ -299,6 +439,30 @@ Against the real Kubernetes deployment (Colima + Minikube) and a real local Olla
   datasets - flagged nearly all real telemetry (both normal and fault) as anomalous on this small
   dataset. `0.1` is a more conventional, defensible default for a small-sample setting, not a
   value tuned to make any specific fault example pass.
-- The graph currently processes one telemetry record at a time (matches how Week 8 will likely
-  call it - once per anomaly candidate) rather than a batch/stream - batching wasn't needed for
-  this week's scope.
+- The graph currently processes one telemetry record at a time (matches how Week 8 calls it - once
+  per anomaly candidate) rather than a batch/stream - batching wasn't needed for this week's scope.
+- **RCA signature matching inherits Week 7's cumulative-counter limitation, and this week's live
+  verification directly demonstrated the consequence**: `auth-key-error`'s and `db-lock`-adjacent
+  signature checks against `http_server_requests_error_count` compare an absolute cumulative value
+  to a fixed threshold, so a long-running session with several unrelated faults tested earlier can
+  leave that counter elevated long after the fault that caused it is over, making a *different*,
+  currently-active fault's RCA misattribute to `auth-key-error` (observed live this week - see
+  "Live verification performed"). The gauge-based signatures (`hikaricp_connections_active`,
+  `jvm_memory_used_bytes`) don't have this problem, since gauges reflect current state, not a
+  lifetime total. Reasonable fix direction for a future week: compute error-count and
+  request-count signatures from a windowed delta (e.g. the difference between this record and the
+  same service's telemetry a fixed number of cycles earlier) rather than the raw cumulative value
+  - not implemented this week, consistent with Week 7's decision to leave the same underlying
+  counter-vs-rate issue as documented future work rather than redesigning the metric schema
+  mid-week.
+- The RCA's optional LLM narrative uses the same small `llama3.2:1b` model as Week 7's
+  interpretation step; live verification showed it can summarize numeric evidence imprecisely
+  (e.g. restating "9.0" as "5" in one sentence of a db-lock narrative). This never affects the
+  deterministic conclusion (`suspected_root_cause_service`, `confidence`,
+  `determination_method`), only the free-text `llm_reasoning` field, and is an expected tradeoff
+  of using a 1.2B-parameter model rather than a larger one (see "Ollama integration" above for why
+  this model was chosen for this machine).
+- Remediation proposal templates exist for the four already-known controlled faults; a genuinely
+  novel anomaly (one that matches no signature and finds no useful retrieval evidence) correctly
+  falls back to a generic, low-risk `"investigate_manually"` proposal rather than a specific
+  action - this is intentional, not a gap to fill by guessing.

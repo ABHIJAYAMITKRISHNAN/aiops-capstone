@@ -25,5 +25,15 @@ class WorkflowState(TypedDict, total=False):
     # --- populated by interpret_node (anomaly branch only) ---
     llm_interpretation: Optional[dict]  # llm.models.AnomalyInterpretation.to_dict()
 
+    # --- Week 8: populated by retrieve_similar_incidents_node (anomaly branch only) ---
+    retrieval: Optional[dict]  # rag.models.RetrievalResult.to_dict()
+
+    # --- Week 8: populated by root_cause_analysis_node (anomaly branch only) ---
+    root_cause_analysis: Optional[dict]  # rca.models.RootCauseAnalysis.to_dict()
+
+    # --- Week 8: populated by propose_remediation_node (anomaly branch only) ---
+    remediation_proposal: Optional[dict]  # remediation.models.RemediationProposal.to_dict() - a
+    # PROPOSAL only; nothing in this graph executes it (see remediation/proposer.py's docstring)
+
     # --- populated by finalize_node ---
     result: dict  # the final structured output - see workflow.py's finalize_node docstring

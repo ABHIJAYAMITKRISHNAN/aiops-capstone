@@ -1,4 +1,4 @@
-"""A minimal, real LangGraph workflow:
+"""A real LangGraph workflow:
 
     raw telemetry record
             |
@@ -11,18 +11,25 @@
    normal       anomaly
       |             |
       |        interpret (Ollama)
+      |             |
+      |     retrieve_similar_incidents (ChromaDB, Memory-set only)
+      |             |
+      |     root_cause_analysis (deterministic signature match + RAG cross-check + optional LLM narrative)
+      |             |
+      |     propose_remediation (deterministic - no LLM, never executes)
        \\           /
          finalize
             |
            END
 
-The LLM is only ever invoked on the anomaly branch - a normal reading never calls Ollama.
-Detectors and the Ollama client are injected into `build_graph()` rather than constructed inside
-node functions, so tests can supply fakes/mocks and so models are loaded once, not per call.
+The LLM is only ever invoked on the anomaly branch - a normal reading never calls Ollama, never
+queries ChromaDB, and never runs RCA/remediation. Detectors and the Ollama client are injected
+into `build_graph()` rather than constructed inside node functions, so tests can supply
+fakes/mocks and so models are loaded once, not per call.
 
-This is intentionally the full extent of Week 7's graph. Week 8 adds RCA/RAG/remediation nodes
-after "anomaly" without needing to touch anything upstream of it - see
-ai-orchestration/README.md "How Week 7 feeds Week 8".
+Week 7 built `extract_features` -> `detect_anomaly` -> `interpret` -> `finalize`. Week 8 adds the
+three nodes between `interpret` and `finalize` without changing anything upstream of `interpret` -
+see ai-orchestration/README.md "How Week 7 feeds Week 8" / "Week 8 architecture".
 """
 from __future__ import annotations
 
@@ -37,6 +44,11 @@ from ..anomaly.models import AnomalyResult, FeatureVector
 from ..llm.interpret import interpret_anomaly
 from ..llm.models import AnomalyInterpretation
 from ..llm.ollama_client import OllamaClient
+from ..rag import retriever as rag_retriever
+from ..rag.models import RetrievalResult
+from ..rca import analyzer as rca_analyzer
+from ..rca.models import RootCauseAnalysis
+from ..remediation import proposer as remediation_proposer
 from .state import WorkflowState
 
 log = logging.getLogger("ai_orchestration.graph.workflow")
@@ -97,6 +109,37 @@ def _make_interpret_node(ollama_client: OllamaClient):
     return _interpret_node
 
 
+def _retrieve_similar_incidents_node(state: WorkflowState) -> dict:
+    anomaly_result = state["anomaly_result"]
+    llm_interpretation = state.get("llm_interpretation") or {}
+    abnormal_summary = (
+        llm_interpretation.get("abnormal_summary") if llm_interpretation.get("status") == "interpreted" else None
+    )
+    query_text = rag_retriever.build_query_text(
+        service=anomaly_result["service"],
+        relevant_feature_values=anomaly_result.get("relevant_feature_values") or {},
+        llm_abnormal_summary=abnormal_summary,
+    )
+    result = rag_retriever.retrieve_similar_incidents(query_text)
+    return {"retrieval": result.to_dict()}
+
+
+def _make_root_cause_analysis_node(ollama_client: OllamaClient):
+    def _root_cause_analysis_node(state: WorkflowState) -> dict:
+        anomaly_result = state["anomaly_result"]
+        retrieval = RetrievalResult(**state["retrieval"])
+        rca = rca_analyzer.analyze(anomaly_result, retrieval, ollama_client)
+        return {"root_cause_analysis": rca.to_dict()}
+
+    return _root_cause_analysis_node
+
+
+def _propose_remediation_node(state: WorkflowState) -> dict:
+    rca = RootCauseAnalysis(**state["root_cause_analysis"])
+    proposal = remediation_proposer.propose_remediation(rca)
+    return {"remediation_proposal": proposal.to_dict()}
+
+
 def _finalize_node(state: WorkflowState) -> dict:
     """Assembles the final structured result. Required fields (Week 7 spec): correlation/incident
     identifiers where available, telemetry evidence, anomaly result, LLM interpretation, and
@@ -105,6 +148,9 @@ def _finalize_node(state: WorkflowState) -> dict:
     record = state["raw_record"]
     anomaly_result = state.get("anomaly_result") or {}
     llm_interpretation = state.get("llm_interpretation")
+    retrieval = state.get("retrieval")
+    root_cause_analysis = state.get("root_cause_analysis")
+    remediation_proposal = state.get("remediation_proposal")
     decision = _route_after_detection(state)
 
     limitations: list[str] = []
@@ -116,6 +162,14 @@ def _finalize_node(state: WorkflowState) -> dict:
         limitations.append("LLM interpretation unavailable: " + str(llm_interpretation.get("reason")))
     if llm_interpretation and llm_interpretation.get("status") == "llm_error":
         limitations.append("LLM interpretation failed: " + str(llm_interpretation.get("reason")))
+    if retrieval and retrieval.get("status") == "collection_unavailable":
+        limitations.append("RAG retrieval unavailable: " + str(retrieval.get("reason")))
+    if retrieval and retrieval.get("status") == "empty":
+        limitations.append("RAG retrieval returned no similar incidents.")
+    if root_cause_analysis and not root_cause_analysis.get("llm_reasoning"):
+        limitations.append("RCA proceeded without an LLM narrative (Ollama unavailable or returned an invalid response).")
+    if root_cause_analysis and root_cause_analysis.get("confidence") == "low":
+        limitations.append("Root cause analysis confidence is low - treat suspected_root_cause_service as tentative.")
 
     result = {
         "correlation_id": state.get("correlation_id") or record.get("correlation_id"),
@@ -130,6 +184,9 @@ def _finalize_node(state: WorkflowState) -> dict:
         },
         "anomaly_result": anomaly_result,
         "llm_interpretation": llm_interpretation,
+        "retrieval": retrieval,
+        "root_cause_analysis": root_cause_analysis,
+        "remediation_proposal": remediation_proposal,
         "limitations": limitations,
     }
     return {"result": result}
@@ -145,6 +202,9 @@ def build_graph(detectors: dict[str, AnomalyDetector], ollama_client: Optional[O
     graph.add_node("extract_features", _extract_features_node)
     graph.add_node("detect_anomaly", _make_detect_anomaly_node(detectors))
     graph.add_node("interpret", _make_interpret_node(ollama_client))
+    graph.add_node("retrieve_similar_incidents", _retrieve_similar_incidents_node)
+    graph.add_node("root_cause_analysis", _make_root_cause_analysis_node(ollama_client))
+    graph.add_node("propose_remediation", _propose_remediation_node)
     graph.add_node("finalize", _finalize_node)
 
     graph.add_edge(START, "extract_features")
@@ -153,7 +213,10 @@ def build_graph(detectors: dict[str, AnomalyDetector], ollama_client: Optional[O
         "detect_anomaly", _route_after_detection,
         {"anomaly": "interpret", "normal": "finalize", "insufficient_data": "finalize"},
     )
-    graph.add_edge("interpret", "finalize")
+    graph.add_edge("interpret", "retrieve_similar_incidents")
+    graph.add_edge("retrieve_similar_incidents", "root_cause_analysis")
+    graph.add_edge("root_cause_analysis", "propose_remediation")
+    graph.add_edge("propose_remediation", "finalize")
     graph.add_edge("finalize", END)
 
     return graph.compile()
